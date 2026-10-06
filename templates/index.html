@@ -1,0 +1,12 @@
+{% extends "base.html" %}{% block body %}
+<div style="display:flex;justify-content:space-between"><h2>授權管理</h2><a class="btn" href="/logout">登出</a></div>
+<div class="card"><h3>新增客戶授權</h3><form method="post" action="/licenses/add">
+客戶名稱 <input name="customer_name" required>
+方案 <select name="plan"><option>Trial</option><option selected>Standard</option><option>Pro</option></select>
+效期 <select name="duration_days"><option value="14">14天</option><option value="30">30天</option><option value="365" selected>365天</option><option value="730">730天</option></select>
+備註 <input name="note"><button class="btn">產生金鑰</button></form></div>
+<div class="card"><table><tr><th>客戶</th><th>方案</th><th>金鑰</th><th>啟用</th><th>到期</th><th>剩餘</th><th>狀態</th><th>操作</th></tr>
+{% for x in licenses %}<tr><td>{{x.customer_name}}</td><td>{{x.plan}}</td><td><code>{{x.license_key}}</code></td><td>{{x.activated_at or '尚未啟用'}}</td><td>{{x.expires_at or '-'}}</td><td>{{x.remaining if x.remaining != '' else '-'}}</td><td>{{x.display_status}}</td><td>
+<form style="display:inline" method="post" action="/licenses/{{x.id}}/extend"><input type="hidden" name="days" value="365"><button class="btn">+1年</button></form>
+<form style="display:inline" method="post" action="/licenses/{{x.id}}/toggle"><button class="btn danger">{{'停用' if x.status=='active' else '恢復'}}</button></form>
+</td></tr>{% endfor %}</table></div>{% endblock %}
