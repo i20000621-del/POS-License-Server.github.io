@@ -1,0 +1,153 @@
+import os, secrets, hashlib
+from datetime import datetime, timedelta, timezone
+from fastapi import FastAPI, Request, Form, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.templating import Jinja2Templates
+from starlette.middleware.sessions import SessionMiddleware
+from sqlalchemy import create_engine, text
+
+app = FastAPI(title="POS License Server V1")
+app.add_middleware(SessionMiddleware, secret_key=os.getenv("SECRET_KEY","CHANGE-ME"), https_only=False, same_site="lax")
+templates = Jinja2Templates(directory="templates")
+
+DATABASE_URL=os.getenv("DATABASE_URL","sqlite:///./license.db")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL="postgresql://"+DATABASE_URL[len("postgres://"):]
+engine=create_engine(DATABASE_URL, pool_pre_ping=True)
+
+ADMIN_PASSWORD=os.getenv("ADMIN_PASSWORD","admin123")
+API_SECRET=os.getenv("LICENSE_API_SECRET","CHANGE-ME-API-SECRET")
+
+def utcnow(): return datetime.now(timezone.utc)
+
+def init_db():
+    with engine.begin() as c:
+        c.execute(text("""CREATE TABLE IF NOT EXISTS licenses(
+          id INTEGER PRIMARY KEY,
+          customer_name VARCHAR(200) NOT NULL,
+          license_key VARCHAR(64) UNIQUE NOT NULL,
+          plan VARCHAR(30) NOT NULL DEFAULT 'Standard',
+          duration_days INTEGER NOT NULL DEFAULT 365,
+          created_at VARCHAR(40) NOT NULL,
+          activated_at VARCHAR(40),
+          expires_at VARCHAR(40),
+          status VARCHAR(20) NOT NULL DEFAULT 'active',
+          note TEXT
+        )"""))
+init_db()
+
+def admin_ok(request): return request.session.get("admin") is True
+def key_hash(k): return hashlib.sha256(k.encode()).hexdigest()[:12]
+def make_key():
+    chars="ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    chunks=["".join(secrets.choice(chars) for _ in range(4)) for _ in range(3)]
+    return "POS-"+"-".join(chunks)
+
+@app.get("/healthz")
+def healthz(): return {"ok":True,"service":"POS License Server V1"}
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request:Request):
+    return templates.TemplateResponse(request,"login.html",{"error":None})
+
+@app.post("/login")
+def login(request:Request,password:str=Form(...)):
+    if secrets.compare_digest(password,ADMIN_PASSWORD):
+        request.session["admin"]=True
+        return RedirectResponse("/",303)
+    return templates.TemplateResponse(request,"login.html",{"error":"密碼錯誤"},status_code=401)
+
+@app.get("/logout")
+def logout(request:Request):
+    request.session.clear()
+    return RedirectResponse("/login",303)
+
+@app.get("/", response_class=HTMLResponse)
+def home(request:Request):
+    if not admin_ok(request): return RedirectResponse("/login",303)
+    with engine.begin() as c:
+        licenses=c.execute(text("SELECT * FROM licenses ORDER BY id DESC")).mappings().all()
+    now=utcnow()
+    data=[]
+    for x in licenses:
+        d=dict(x); d["remaining"]=""
+        if d["expires_at"]:
+            try:
+                exp=datetime.fromisoformat(d["expires_at"])
+                d["remaining"]=max(0,(exp-now).days)
+                if exp <= now: d["display_status"]="expired"
+                else: d["display_status"]=d["status"]
+            except: d["display_status"]=d["status"]
+        else: d["display_status"]="未啟用" if d["status"]=="active" else d["status"]
+        data.append(d)
+    return templates.TemplateResponse(request,"index.html",{"licenses":data})
+
+@app.post("/licenses/add")
+def add_license(request:Request,customer_name:str=Form(...),plan:str=Form("Standard"),
+                duration_days:int=Form(365),note:str=Form("")):
+    if not admin_ok(request): return RedirectResponse("/login",303)
+    key=make_key()
+    with engine.begin() as c:
+        c.execute(text("""INSERT INTO licenses
+          (customer_name,license_key,plan,duration_days,created_at,status,note)
+          VALUES(:n,:k,:p,:d,:c,'active',:note)"""),
+          {"n":customer_name.strip(),"k":key,"p":plan,"d":duration_days,
+           "c":utcnow().isoformat(),"note":note})
+    return RedirectResponse("/",303)
+
+@app.post("/licenses/{license_id}/extend")
+def extend(request:Request,license_id:int,days:int=Form(...)):
+    if not admin_ok(request): return RedirectResponse("/login",303)
+    with engine.begin() as c:
+        row=c.execute(text("SELECT * FROM licenses WHERE id=:id"),{"id":license_id}).mappings().first()
+        if not row: raise HTTPException(404)
+        base=utcnow()
+        if row["expires_at"]:
+            exp=datetime.fromisoformat(row["expires_at"])
+            if exp>base: base=exp
+        c.execute(text("UPDATE licenses SET expires_at=:e,status='active' WHERE id=:id"),
+                  {"e":(base+timedelta(days=days)).isoformat(),"id":license_id})
+    return RedirectResponse("/",303)
+
+@app.post("/licenses/{license_id}/toggle")
+def toggle(request:Request,license_id:int):
+    if not admin_ok(request): return RedirectResponse("/login",303)
+    with engine.begin() as c:
+        row=c.execute(text("SELECT status FROM licenses WHERE id=:id"),{"id":license_id}).first()
+        if not row: raise HTTPException(404)
+        new="disabled" if row[0]=="active" else "active"
+        c.execute(text("UPDATE licenses SET status=:s WHERE id=:id"),{"s":new,"id":license_id})
+    return RedirectResponse("/",303)
+
+@app.post("/api/v1/activate")
+async def activate(request:Request):
+    body=await request.json()
+    key=(body.get("license_key") or "").strip().upper()
+    with engine.begin() as c:
+        row=c.execute(text("SELECT * FROM licenses WHERE license_key=:k"),{"k":key}).mappings().first()
+        if not row: return {"valid":False,"reason":"invalid_key"}
+        if row["status"]!="active": return {"valid":False,"reason":"disabled"}
+        activated=row["activated_at"]; expires=row["expires_at"]
+        if not activated:
+            now=utcnow(); exp=now+timedelta(days=int(row["duration_days"]))
+            activated=now.isoformat(); expires=exp.isoformat()
+            c.execute(text("UPDATE licenses SET activated_at=:a,expires_at=:e WHERE id=:id"),
+                      {"a":activated,"e":expires,"id":row["id"]})
+        exp=datetime.fromisoformat(expires)
+        if exp<=utcnow(): return {"valid":False,"reason":"expired","expires_at":expires}
+        return {"valid":True,"customer_name":row["customer_name"],"plan":row["plan"],
+                "activated_at":activated,"expires_at":expires}
+
+@app.post("/api/v1/verify")
+async def verify(request:Request):
+    body=await request.json()
+    key=(body.get("license_key") or "").strip().upper()
+    with engine.begin() as c:
+        row=c.execute(text("SELECT * FROM licenses WHERE license_key=:k"),{"k":key}).mappings().first()
+    if not row: return {"valid":False,"reason":"invalid_key"}
+    if row["status"]!="active": return {"valid":False,"reason":"disabled"}
+    if not row["activated_at"]: return {"valid":False,"reason":"not_activated"}
+    exp=datetime.fromisoformat(row["expires_at"])
+    if exp<=utcnow(): return {"valid":False,"reason":"expired","expires_at":row["expires_at"]}
+    return {"valid":True,"customer_name":row["customer_name"],"plan":row["plan"],
+            "expires_at":row["expires_at"],"remaining_days":max(0,(exp-utcnow()).days)}
