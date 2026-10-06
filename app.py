@@ -184,3 +184,7 @@ async def verify(request:Request):
     if exp<=utcnow(): return {"valid":False,"reason":"expired","expires_at":row["expires_at"]}
     return {"valid":True,"customer_name":row["customer_name"],"plan":row["plan"],
             "expires_at":row["expires_at"],"remaining_days":max(0,(exp-utcnow()).days)}
+    exp=datetime.fromisoformat(row["expires_at"])
+    if exp<=utcnow(): return {"valid":False,"reason":"expired","expires_at":row["expires_at"]}
+    return {"valid":True,"customer_name":row["customer_name"],"plan":row["plan"],
+            "expires_at":row["expires_at"],"remaining_days":max(0,(exp-utcnow()).days)}
